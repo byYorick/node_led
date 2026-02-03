@@ -25,6 +25,7 @@
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
+#include "lwip/ip4_addr.h"
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -49,6 +50,8 @@
 
 #define LEDC_TIMER_RESOLUTION LEDC_TIMER_12_BIT
 #define LEDC_MAX_DUTY ((1 << LEDC_TIMER_RESOLUTION) - 1)
+#define PWM_SCALE 100
+#define HTML_BUF_SIZE 8192
 
 #define SETTINGS_MAGIC_V1 0x4C45444E /* "LEDN" */
 #define SETTINGS_MAGIC_V2 0x4C454432 /* "LED2" */
@@ -84,13 +87,20 @@ static const char *TAG = "node_led";
 static settings_t g_settings;
 static SemaphoreHandle_t g_settings_mutex;
 static SemaphoreHandle_t g_rtc_mutex;
+static SemaphoreHandle_t g_test_mutex;
 
 static int32_t g_actual_red = 0;
 static int32_t g_actual_blue = 0;
+static int64_t g_test_start_us = 0;
+static int64_t g_test_until_us = 0;
+static int g_test_stage = -1;
+
+#define TEST_STEP_SEC 3
+#define TEST_TOTAL_SEC (TEST_STEP_SEC * 2)
 
 static void ds1302_delay(void)
 {
-    ets_delay_us(2);
+    esp_rom_delay_us(2);
 }
 
 static void ds1302_ce(int level)
@@ -164,6 +174,18 @@ static uint8_t ds1302_read_reg(uint8_t reg)
     return value;
 }
 
+static void ds1302_read_burst(uint8_t *data, size_t len)
+{
+    ds1302_ce(1);
+    ds1302_delay();
+    ds1302_write_byte(0xBF); /* clock burst read */
+    for (size_t i = 0; i < len; i++) {
+        data[i] = ds1302_read_byte();
+    }
+    ds1302_ce(0);
+    ds1302_delay();
+}
+
 static uint8_t bin2bcd(uint8_t value)
 {
     return (uint8_t)(((value / 10) << 4) | (value % 10));
@@ -184,6 +206,20 @@ static int calc_dow(int y, int m, int d)
     return (dow == 0) ? 1 : (dow + 1); /* 1..7 */
 }
 
+static bool is_leap_year(int y)
+{
+    return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
+}
+
+static int days_in_month(int y, int m)
+{
+    static const int days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (m == 2 && is_leap_year(y)) {
+        return 29;
+    }
+    return days[m - 1];
+}
+
 static void ds1302_init(void)
 {
     gpio_config_t io_conf = {
@@ -202,18 +238,21 @@ static void ds1302_init(void)
 
 static bool ds1302_get_time(rtc_time_t *t)
 {
-    uint8_t sec = ds1302_read_reg(0x80 | 0x01);
+    uint8_t data[8] = {0};
+    ds1302_read_burst(data, sizeof(data));
+
+    uint8_t sec = data[0];
+    uint8_t min = data[1];
+    uint8_t hour = data[2];
+    uint8_t date = data[3];
+    uint8_t month = data[4];
+    uint8_t day = data[5];
+    uint8_t year = data[6];
+
     if (sec & 0x80) {
         sec &= 0x7F;
         ds1302_write_reg(0x80, sec);
     }
-
-    uint8_t min = ds1302_read_reg(0x82 | 0x01);
-    uint8_t hour = ds1302_read_reg(0x84 | 0x01);
-    uint8_t date = ds1302_read_reg(0x86 | 0x01);
-    uint8_t month = ds1302_read_reg(0x88 | 0x01);
-    uint8_t day = ds1302_read_reg(0x8A | 0x01);
-    uint8_t year = ds1302_read_reg(0x8C | 0x01);
 
     if (hour & 0x80) {
         int pm = hour & 0x20;
@@ -249,6 +288,8 @@ static void ds1302_set_time(const rtc_time_t *t)
     ds1302_write_reg(0x88, bin2bcd(t->month));
     ds1302_write_reg(0x8A, bin2bcd(t->dow));
     ds1302_write_reg(0x8C, bin2bcd((uint8_t)(t->year - 2000)));
+
+    ds1302_write_reg(0x8E, 0x80); /* write protect on */
 }
 
 static void settings_set_defaults(settings_t *s)
@@ -267,6 +308,8 @@ static void settings_set_defaults(settings_t *s)
     s->pwm_freq_hz = 1000;
     s->ramp_sec = 300;
 }
+
+static void settings_save(const settings_t *s);
 
 static void settings_load(settings_t *s)
 {
@@ -423,11 +466,13 @@ static bool schedule_is_on(const settings_t *s, int hour, int min)
 static void control_task(void *arg)
 {
     (void)arg;
-    const int32_t scale = 100; /* 0.01% */
+    const int32_t scale = PWM_SCALE; /* 0.01% */
 
     while (true) {
         rtc_time_t now = {0};
         settings_t s;
+        bool test_active = false;
+        int64_t now_us = esp_timer_get_time();
 
         if (xSemaphoreTake(g_rtc_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             ds1302_get_time(&now);
@@ -441,15 +486,54 @@ static void control_task(void *arg)
             settings_set_defaults(&s);
         }
 
-        bool is_on = schedule_is_on(&s, now.hour, now.min);
-        int32_t target_red = is_on ? s.red_pct : 0;
-        int32_t target_blue = is_on ? s.blue_pct : 0;
+        if (xSemaphoreTake(g_test_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (g_test_until_us != 0 && now_us >= g_test_until_us) {
+                g_test_until_us = 0;
+                g_test_stage = -1;
+            }
+            test_active = (g_test_until_us != 0 && now_us < g_test_until_us);
+            xSemaphoreGive(g_test_mutex);
+        }
 
-        int32_t step = (s.ramp_sec == 0) ? 100 * scale : (100 * scale) / s.ramp_sec;
-        if (step < 1) step = 1;
+        int32_t target_red = 0;
+        int32_t target_blue = 0;
+
+        if (test_active) {
+            int64_t elapsed = now_us - g_test_start_us;
+            int step = (elapsed >= 0) ? (int)(elapsed / ((int64_t)TEST_STEP_SEC * 1000000)) : 0;
+            if (step < 0) step = 0;
+            if (step > 1) step = 1;
+
+            target_red = (step == 0) ? 100 : 0;
+            target_blue = (step == 1) ? 100 : 0;
+
+            if (step != g_test_stage) {
+                g_test_stage = step;
+                pwm_set_percent(target_red, target_blue);
+                vTaskDelay(pdMS_TO_TICKS(20));
+                int red_level = gpio_get_level(GPIO_PWM_RED);
+                int blue_level = gpio_get_level(GPIO_PWM_BLUE);
+                ESP_LOGI(TAG, "Тест %s: GPIO red=%d blue=%d",
+                         (step == 0) ? "красный" : "синий", red_level, blue_level);
+            } else {
+                pwm_set_percent(target_red, target_blue);
+            }
+
+            g_actual_red = target_red * scale;
+            g_actual_blue = target_blue * scale;
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        } else {
+            bool is_on = schedule_is_on(&s, now.hour, now.min);
+            target_red = is_on ? s.red_pct : 0;
+            target_blue = is_on ? s.blue_pct : 0;
+        }
 
         int32_t target_red_scaled = target_red * scale;
         int32_t target_blue_scaled = target_blue * scale;
+
+        int32_t step = (s.ramp_sec == 0) ? 100 * scale : (100 * scale) / s.ramp_sec;
+        if (step < 1) step = 1;
 
         if (g_actual_red < target_red_scaled) {
             g_actual_red += step;
@@ -552,64 +636,121 @@ static esp_err_t http_root_get_handler(httpd_req_t *req)
     }
 
     bool is_on = schedule_is_on(&s, now.hour, now.min);
+    const char *status_class = is_on ? "badge" : "badge off";
+    const char *status_text = is_on ? "Включено" : "Выключено";
 
-    char html[4096];
+    char *html = calloc(1, HTML_BUF_SIZE);
+    if (!html) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Недостаточно памяти");
+        return ESP_FAIL;
+    }
     char *ptr = html;
-    size_t left = sizeof(html);
+    size_t left = HTML_BUF_SIZE;
 
     html_append(&ptr, &left,
                 "<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
                 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-                "<title>Управление светом</title>"
-                "<style>body{font-family:Arial,sans-serif;max-width:720px;margin:20px auto;"
-                "padding:0 12px;background:#f5f5f5;}"
-                "h1{font-size:22px;}"
-                "label{display:block;margin-top:12px;}"
-                "input,select{padding:6px;font-size:16px;width:100%%;box-sizing:border-box;}"
-                "button{margin-top:16px;padding:10px 16px;font-size:16px;}"
-                ".card{background:#fff;padding:16px;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,0.1);}"
-                "</style></head><body><div class=\"card\">"
-                "<h1>Настройки светильника</h1>");
+                "<title>Фитосвет</title>"
+                "<style>"
+                ":root{--bg1:#0b1220;--bg2:#101b2d;--card:#111827;--accent:#34d399;"
+                "--accent2:#60a5fa;--text:#e5e7eb;--muted:#9ca3af;}"
+                "*{box-sizing:border-box;}"
+                "body{margin:0;font-family:\"Trebuchet MS\",\"Verdana\",sans-serif;color:var(--text);"
+                "background:radial-gradient(1200px 400px at 15%% -10%%,#1f2937,transparent),"
+                "linear-gradient(160deg,var(--bg1),var(--bg2));min-height:100vh;}"
+                ".container{max-width:860px;margin:0 auto;padding:18px 14px 36px;}"
+                "header{display:flex;flex-direction:column;gap:10px;margin-bottom:14px;}"
+                ".title{font-family:\"Georgia\",\"Times New Roman\",serif;font-size:26px;letter-spacing:.2px;}"
+                ".sub{color:var(--muted);font-size:13px;}"
+                ".badge{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;"
+                "background:rgba(52,211,153,.18);color:#a7f3d0;font-weight:700;font-size:12px;}"
+                ".badge.off{background:rgba(248,113,113,.18);color:#fecaca;}"
+                ".grid{display:grid;grid-template-columns:1fr;gap:14px;}"
+                ".card{background:rgba(17,24,39,.92);border:1px solid rgba(148,163,184,.18);"
+                "border-radius:16px;padding:16px;box-shadow:0 12px 30px rgba(0,0,0,.25);}"
+                ".card h2{margin:0 0 12px;font-size:16px;color:#f9fafb;}"
+                ".time{font-size:20px;font-weight:700;letter-spacing:.4px;}"
+                "label{display:block;margin-top:10px;font-size:12px;color:var(--muted);}"
+                "input,select,button{width:100%%;padding:10px 12px;border-radius:10px;"
+                "border:1px solid rgba(148,163,184,.2);background:#0b1220;color:var(--text);font-size:15px;}"
+                "input:focus,select:focus{outline:none;border-color:var(--accent2);"
+                "box-shadow:0 0 0 3px rgba(96,165,250,.2);}"
+                ".row{display:grid;grid-template-columns:1fr 1fr;gap:10px;}"
+                ".button{margin-top:14px;background:linear-gradient(135deg,var(--accent),#22c55e);"
+                "border:none;color:#062a1f;font-weight:800;}"
+                ".button.alt{background:linear-gradient(135deg,var(--accent2),#38bdf8);color:#041322;}"
+                ".button.ghost{background:transparent;border:1px dashed rgba(148,163,184,.4);color:var(--text);}"
+                ".note{margin-top:8px;font-size:12px;color:var(--muted);}"
+                ".footer{margin-top:12px;font-size:12px;color:var(--muted);}"
+                "@media(min-width:760px){header{flex-direction:row;align-items:center;justify-content:space-between;}"
+                ".grid{grid-template-columns:1fr 1fr;}"
+                ".card.full{grid-column:1/-1;}}"
+                "</style></head><body><div class=\"container\">"
+                "<header><div>"
+                "<div class=\"title\">Фитосвет • контроллер</div>"
+                "<div class=\"sub\">ESP32 + DS1302</div>"
+                "</div>"
+                "<div class=\"%s\">Статус: %s</div></header>",
+                status_class, status_text);
 
     html_append(&ptr, &left,
-                "<p>Текущее время RTC: %04d-%02d-%02d %02d:%02d:%02d</p>",
+                "<div class=\"grid\">"
+                "<div class=\"card full\">"
+                "<h2>Текущее время</h2>"
+                "<div class=\"time\">%04d-%02d-%02d %02d:%02d:%02d</div>"
+                "<div class=\"note\">Расписание действует каждый день.</div>"
+                "</div>",
                 now.year, now.month, now.day, now.hour, now.min, now.sec);
 
     html_append(&ptr, &left,
-                "<p>Статус: <b>%s</b></p>", is_on ? "Включено" : "Выключено");
-
-    html_append(&ptr, &left,
+                "<div class=\"card\">"
+                "<h2>Расписание</h2>"
                 "<form method=\"POST\" action=\"/save\">"
-                "<label>Интервал 1: включение"
-                "<input type=\"time\" name=\"on_time\" value=\"%02d:%02d\"></label>"
-                "<label>Интервал 1: выключение"
-                "<input type=\"time\" name=\"off_time\" value=\"%02d:%02d\"></label>"
-                "<label>Интервал 2: включение"
-                "<input type=\"time\" name=\"on_time2\" value=\"%02d:%02d\"></label>"
-                "<label>Интервал 2: выключение"
-                "<input type=\"time\" name=\"off_time2\" value=\"%02d:%02d\"></label>",
+                "<div class=\"row\">"
+                "<div><label>Интервал 1: включение</label>"
+                "<input type=\"time\" name=\"on_time\" value=\"%02d:%02d\"></div>"
+                "<div><label>Интервал 1: выключение</label>"
+                "<input type=\"time\" name=\"off_time\" value=\"%02d:%02d\"></div>"
+                "</div>"
+                "<div class=\"row\">"
+                "<div><label>Интервал 2: включение</label>"
+                "<input type=\"time\" name=\"on_time2\" value=\"%02d:%02d\"></div>"
+                "<div><label>Интервал 2: выключение</label>"
+                "<input type=\"time\" name=\"off_time2\" value=\"%02d:%02d\"></div>"
+                "</div>",
                 s.on_hour, s.on_min, s.off_hour, s.off_min,
                 s.on2_hour, s.on2_min, s.off2_hour, s.off2_min);
 
     html_append(&ptr, &left,
-                "<label>Интенсивность красного (%%)"
-                "<input type=\"number\" min=\"0\" max=\"100\" name=\"red_pct\" value=\"%u\"></label>",
-                s.red_pct);
+                "<label>Время плавного перехода (сек)</label>"
+                "<input type=\"number\" min=\"0\" max=\"3600\" name=\"ramp_sec\" value=\"%u\">"
+                "<button class=\"button\" type=\"submit\">Сохранить расписание</button>"
+                "</form>"
+                "</div>",
+                s.ramp_sec);
 
     html_append(&ptr, &left,
-                "<label>Интенсивность синего (%%)"
-                "<input type=\"number\" min=\"0\" max=\"100\" name=\"blue_pct\" value=\"%u\"></label>",
-                s.blue_pct);
-
-    html_append(&ptr, &left,
-                "<label>Частота ШИМ (Гц)"
+                "<div class=\"card\">"
+                "<h2>Мощность</h2>"
+                "<form method=\"POST\" action=\"/save\">"
+                "<div class=\"row\">"
+                "<div><label>Красный канал (%%)</label>"
+                "<input type=\"number\" min=\"0\" max=\"100\" name=\"red_pct\" value=\"%u\"></div>"
+                "<div><label>Синий канал (%%)</label>"
+                "<input type=\"number\" min=\"0\" max=\"100\" name=\"blue_pct\" value=\"%u\"></div>"
+                "</div>"
+                "<label>Частота ШИМ (Гц)</label>"
                 "<select name=\"pwm_freq\">"
                 "<option value=\"500\" %s>500</option>"
                 "<option value=\"1000\" %s>1000</option>"
                 "<option value=\"2000\" %s>2000</option>"
                 "<option value=\"5000\" %s>5000</option>"
                 "<option value=\"10000\" %s>10000</option>"
-                "</select></label>",
+                "</select>"
+                "<button class=\"button alt\" type=\"submit\">Сохранить мощность</button>"
+                "</form>"
+                "</div>",
+                s.red_pct, s.blue_pct,
                 (s.pwm_freq_hz == 500) ? "selected" : "",
                 (s.pwm_freq_hz == 1000) ? "selected" : "",
                 (s.pwm_freq_hz == 2000) ? "selected" : "",
@@ -617,26 +758,34 @@ static esp_err_t http_root_get_handler(httpd_req_t *req)
                 (s.pwm_freq_hz == 10000) ? "selected" : "");
 
     html_append(&ptr, &left,
-                "<label>Время плавного перехода (сек)"
-                "<input type=\"number\" min=\"0\" max=\"3600\" name=\"ramp_sec\" value=\"%u\"></label>",
-                s.ramp_sec);
-
-    html_append(&ptr, &left,
-                "<label>Установить дату RTC"
-                "<input type=\"date\" name=\"set_date\" value=\"%04d-%02d-%02d\"></label>"
-                "<label>Установить время RTC"
-                "<input type=\"time\" name=\"set_time\" value=\"%02d:%02d\"></label>",
+                "<div class=\"card\">"
+                "<h2>Время RTC</h2>"
+                "<form method=\"POST\" action=\"/set_time\">"
+                "<label>Дата</label>"
+                "<input type=\"date\" name=\"set_date\" value=\"%04d-%02d-%02d\">"
+                "<label>Время</label>"
+                "<input type=\"time\" name=\"set_time\" value=\"%02d:%02d\">"
+                "<button class=\"button alt\" type=\"submit\">Установить дату и время</button>"
+                "</form>"
+                "</div>",
                 now.year, now.month, now.day, now.hour, now.min);
 
     html_append(&ptr, &left,
-                "<button type=\"submit\">Сохранить</button>"
+                "<div class=\"card\">"
+                "<h2>Проверка</h2>"
+                "<form method=\"POST\" action=\"/test\">"
+                "<button class=\"button ghost\" type=\"submit\">Тест светодиодов</button>"
                 "</form>"
-                "<p>GPIO: DS1302 CE=%d IO=%d SCLK=%d, PWM красный=%d, PWM синий=%d</p>"
+                "<div class=\"note\">Тест: 3 секунды красный, затем 3 секунды синий.</div>"
+                "</div>"
+                "</div>"
+                "<div class=\"footer\">GPIO: DS1302 CE=%d IO=%d SCLK=%d, PWM красный=%d, PWM синий=%d</div>"
                 "</div></body></html>",
                 GPIO_DS1302_CE, GPIO_DS1302_IO, GPIO_DS1302_SCLK, GPIO_PWM_RED, GPIO_PWM_BLUE);
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    free(html);
     return ESP_OK;
 }
 
@@ -682,6 +831,21 @@ static bool get_param(const char *body, const char *key, char *out, size_t out_l
     return false;
 }
 
+static void start_led_test(uint32_t duration_sec)
+{
+    int64_t now = esp_timer_get_time();
+    int64_t until = now + (int64_t)duration_sec * 1000000;
+    if (xSemaphoreTake(g_test_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        g_test_start_us = now;
+        g_test_until_us = until;
+        g_test_stage = -1;
+        xSemaphoreGive(g_test_mutex);
+    }
+    g_actual_red = 100 * PWM_SCALE;
+    g_actual_blue = 100 * PWM_SCALE;
+    pwm_set_percent(100, 100);
+}
+
 static bool parse_hhmm(const char *str, int *hour, int *min)
 {
     if (!str || strlen(str) < 4) return false;
@@ -699,28 +863,126 @@ static bool parse_ymd(const char *str, int *y, int *m, int *d)
     int yy = 0, mm = 0, dd = 0;
     if (sscanf(str, "%d-%d-%d", &yy, &mm, &dd) != 3) return false;
     if (yy < 2000 || yy > 2099 || mm < 1 || mm > 12 || dd < 1 || dd > 31) return false;
+    if (dd > days_in_month(yy, mm)) return false;
     *y = yy; *m = mm; *d = dd;
     return true;
+}
+
+static int read_req_body(httpd_req_t *req, char *buf, size_t buf_len)
+{
+    int total = req->content_len;
+    int received = 0;
+    int stored = 0;
+    char dump[128];
+
+    if (buf_len == 0) {
+        return -1;
+    }
+
+    while (received < total) {
+        int remaining = total - received;
+        char *dest = NULL;
+        int max = 0;
+
+        if (stored < (int)buf_len - 1) {
+            dest = buf + stored;
+            max = (int)buf_len - 1 - stored;
+            if (max > remaining) {
+                max = remaining;
+            }
+        } else {
+            dest = dump;
+            max = remaining > (int)sizeof(dump) ? (int)sizeof(dump) : remaining;
+        }
+
+        int r = httpd_req_recv(req, dest, max);
+        if (r <= 0) {
+            return -1;
+        }
+        received += r;
+
+        if (dest != dump) {
+            stored += r;
+            if (stored > (int)buf_len - 1) {
+                stored = (int)buf_len - 1;
+            }
+        }
+    }
+
+    buf[stored] = '\0';
+    return stored;
+}
+
+static bool apply_rtc_from_body(const char *body)
+{
+    char buf[64];
+    rtc_time_t t = {0};
+    bool has_date = false;
+    bool has_time = false;
+
+    if (get_param(body, "set_date", buf, sizeof(buf))) {
+        int yy, mm, dd;
+        if (parse_ymd(buf, &yy, &mm, &dd)) {
+            t.year = yy;
+            t.month = mm;
+            t.day = dd;
+            has_date = true;
+        }
+    }
+
+    if (get_param(body, "set_time", buf, sizeof(buf))) {
+        int hh, mn;
+        if (parse_hhmm(buf, &hh, &mn)) {
+            t.hour = hh;
+            t.min = mn;
+            t.sec = 0;
+            has_time = true;
+        }
+    }
+
+    if (!has_date && !has_time) {
+        return false;
+    }
+
+    if (!has_date || !has_time) {
+        rtc_time_t current = {0};
+        if (xSemaphoreTake(g_rtc_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            ds1302_get_time(&current);
+            xSemaphoreGive(g_rtc_mutex);
+        } else {
+            return false;
+        }
+
+        if (!has_date) {
+            t.year = current.year;
+            t.month = current.month;
+            t.day = current.day;
+        }
+        if (!has_time) {
+            t.hour = current.hour;
+            t.min = current.min;
+            t.sec = current.sec;
+        }
+    }
+
+    t.dow = calc_dow(t.year, t.month, t.day);
+
+    if (xSemaphoreTake(g_rtc_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        ds1302_set_time(&t);
+        xSemaphoreGive(g_rtc_mutex);
+        return true;
+    }
+
+    return false;
 }
 
 static esp_err_t http_save_post_handler(httpd_req_t *req)
 {
     char body[512];
-    int total = req->content_len;
-    if (total >= (int)sizeof(body)) {
-        total = sizeof(body) - 1;
+    if (read_req_body(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Ошибка чтения");
+        return ESP_FAIL;
     }
-
-    int received = 0;
-    while (received < total) {
-        int r = httpd_req_recv(req, body + received, total - received);
-        if (r <= 0) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Ошибка чтения");
-            return ESP_FAIL;
-        }
-        received += r;
-    }
-    body[received] = '\0';
 
     settings_t s;
     if (xSemaphoreTake(g_settings_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -740,6 +1002,14 @@ static esp_err_t http_save_post_handler(httpd_req_t *req)
     if (get_param(body, "off_time", buf, sizeof(buf)) && parse_hhmm(buf, &h, &m)) {
         s.off_hour = h;
         s.off_min = m;
+    }
+    if (get_param(body, "on_time2", buf, sizeof(buf)) && parse_hhmm(buf, &h, &m)) {
+        s.on2_hour = h;
+        s.on2_min = m;
+    }
+    if (get_param(body, "off_time2", buf, sizeof(buf)) && parse_hhmm(buf, &h, &m)) {
+        s.off2_hour = h;
+        s.off2_min = m;
     }
     if (get_param(body, "red_pct", buf, sizeof(buf))) {
         int v = atoi(buf);
@@ -766,47 +1036,6 @@ static esp_err_t http_save_post_handler(httpd_req_t *req)
         s.ramp_sec = v;
     }
 
-    bool set_time = false;
-    rtc_time_t t = {0};
-    if (get_param(body, "set_date", buf, sizeof(buf))) {
-        int yy, mm, dd;
-        if (parse_ymd(buf, &yy, &mm, &dd)) {
-            t.year = yy;
-            t.month = mm;
-            t.day = dd;
-            set_time = true;
-        }
-    }
-    if (get_param(body, "set_time", buf, sizeof(buf))) {
-        int hh, mn;
-        if (parse_hhmm(buf, &hh, &mn)) {
-            t.hour = hh;
-            t.min = mn;
-            t.sec = 0;
-            set_time = true;
-        }
-    }
-
-    if (set_time) {
-        if (t.year == 0) {
-            rtc_time_t current = {0};
-            if (xSemaphoreTake(g_rtc_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-                ds1302_get_time(&current);
-                xSemaphoreGive(g_rtc_mutex);
-            }
-            t.year = current.year;
-            t.month = current.month;
-            t.day = current.day;
-        }
-        if (t.month > 0 && t.day > 0) {
-            t.dow = calc_dow(t.year, t.month, t.day);
-            if (xSemaphoreTake(g_rtc_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-                ds1302_set_time(&t);
-                xSemaphoreGive(g_rtc_mutex);
-            }
-        }
-    }
-
     if (xSemaphoreTake(g_settings_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
         g_settings = s;
         xSemaphoreGive(g_settings_mutex);
@@ -820,13 +1049,53 @@ static esp_err_t http_save_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t http_set_time_post_handler(httpd_req_t *req)
+{
+    char body[256];
+    if (read_req_body(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Ошибка чтения");
+        return ESP_FAIL;
+    }
+
+    if (!apply_rtc_from_body(body)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Неверные данные даты/времени");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, "", 0);
+    return ESP_OK;
+}
+
+static esp_err_t http_test_post_handler(httpd_req_t *req)
+{
+    char body[64];
+    if (read_req_body(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Ошибка чтения");
+        return ESP_FAIL;
+    }
+
+    start_led_test(TEST_TOTAL_SEC);
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, "", 0);
+    return ESP_OK;
+}
+
 static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 10;
+    config.stack_size = 12288;
+    config.lru_purge_enable = true;
+    config.max_open_sockets = 4;
 
     httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) != ESP_OK) {
+    esp_err_t err = httpd_start(&server, &config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP server start failed: %s", esp_err_to_name(err));
         return NULL;
     }
 
@@ -846,6 +1115,23 @@ static httpd_handle_t start_webserver(void)
     };
     httpd_register_uri_handler(server, &save);
 
+    httpd_uri_t set_time = {
+        .uri = "/set_time",
+        .method = HTTP_POST,
+        .handler = http_set_time_post_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &set_time);
+
+    httpd_uri_t test = {
+        .uri = "/test",
+        .method = HTTP_POST,
+        .handler = http_test_post_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &test);
+
+    ESP_LOGI(TAG, "HTTP server started on port %d", config.server_port);
     return server;
 }
 
@@ -860,14 +1146,34 @@ void app_main(void)
 
     g_settings_mutex = xSemaphoreCreateMutex();
     g_rtc_mutex = xSemaphoreCreateMutex();
+    g_test_mutex = xSemaphoreCreateMutex();
 
     settings_load(&g_settings);
 
     ds1302_init();
     pwm_init(g_settings.pwm_freq_hz);
 
+    {
+        rtc_time_t now = {0};
+        if (ds1302_get_time(&now)) {
+            bool is_on = schedule_is_on(&g_settings, now.hour, now.min);
+            int32_t red = is_on ? g_settings.red_pct : 0;
+            int32_t blue = is_on ? g_settings.blue_pct : 0;
+            g_actual_red = red * PWM_SCALE;
+            g_actual_blue = blue * PWM_SCALE;
+            pwm_set_percent(red, blue);
+        }
+    }
+
     wifi_init_ap();
-    start_webserver();
+    httpd_handle_t server = NULL;
+    for (int i = 0; i < 3 && !server; i++) {
+        server = start_webserver();
+        if (!server) {
+            ESP_LOGW(TAG, "HTTP server retry %d/3", i + 1);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
 
     xTaskCreate(control_task, "control_task", 4096, NULL, 5, NULL);
 
