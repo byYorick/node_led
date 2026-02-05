@@ -47,6 +47,8 @@
 
 #define GPIO_PWM_RED  18
 #define GPIO_PWM_BLUE 19
+#define GPIO_BOOT_BTN 0
+#define GPIO_STATUS_LED 2
 
 #define LEDC_TIMER_RESOLUTION LEDC_TIMER_12_BIT
 #define LEDC_MAX_DUTY ((1 << LEDC_TIMER_RESOLUTION) - 1)
@@ -97,6 +99,14 @@ static int g_test_stage = -1;
 
 #define TEST_STEP_SEC 3
 #define TEST_TOTAL_SEC (TEST_STEP_SEC * 2)
+#define WEB_IDLE_TIMEOUT_SEC 300
+#define WEB_LONG_PRESS_SEC 5
+
+static httpd_handle_t g_http_server = NULL;
+static esp_netif_t *g_ap_netif = NULL;
+static bool g_wifi_inited = false;
+static int64_t g_last_http_activity_us = 0;
+static bool g_web_active = false;
 
 static void ds1302_delay(void)
 {
@@ -504,8 +514,8 @@ static void control_task(void *arg)
             if (step < 0) step = 0;
             if (step > 1) step = 1;
 
-            target_red = (step == 0) ? 100 : 0;
-            target_blue = (step == 1) ? 100 : 0;
+            target_red = (step == 0) ? s.red_pct : 0;
+            target_blue = (step == 1) ? s.blue_pct : 0;
 
             if (step != g_test_stage) {
                 g_test_stage = step;
@@ -513,8 +523,9 @@ static void control_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(20));
                 int red_level = gpio_get_level(GPIO_PWM_RED);
                 int blue_level = gpio_get_level(GPIO_PWM_BLUE);
-                ESP_LOGI(TAG, "Тест %s: GPIO red=%d blue=%d",
-                         (step == 0) ? "красный" : "синий", red_level, blue_level);
+                ESP_LOGI(TAG, "Тест %s: GPIO red=%d blue=%d (%%=%d/%d)",
+                         (step == 0) ? "красный" : "синий",
+                         red_level, blue_level, target_red, target_blue);
             } else {
                 pwm_set_percent(target_red, target_blue);
             }
@@ -559,14 +570,17 @@ static void control_task(void *arg)
 
 static void wifi_init_ap(void)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    if (!g_wifi_inited) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    esp_netif_t *netif = esp_netif_create_default_wifi_ap();
-    assert(netif);
+        g_ap_netif = esp_netif_create_default_wifi_ap();
+        assert(g_ap_netif);
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        g_wifi_inited = true;
+    }
 
     wifi_config_t wifi_config = {0};
     strncpy((char *)wifi_config.ap.ssid, WIFI_SSID, sizeof(wifi_config.ap.ssid));
@@ -587,14 +601,22 @@ static void wifi_init_ap(void)
     IP4_ADDR(&ip_info.gw, WIFI_AP_IP1, WIFI_AP_IP2, WIFI_AP_IP3, WIFI_AP_IP4);
     IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
 
-    esp_netif_dhcps_stop(netif);
-    esp_netif_set_ip_info(netif, &ip_info);
-    esp_netif_dhcps_start(netif);
+    esp_netif_dhcps_stop(g_ap_netif);
+    esp_netif_set_ip_info(g_ap_netif, &ip_info);
+    esp_netif_dhcps_start(g_ap_netif);
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "Wi-Fi AP started. SSID=%s IP=%d.%d.%d.%d", WIFI_SSID,
              WIFI_AP_IP1, WIFI_AP_IP2, WIFI_AP_IP3, WIFI_AP_IP4);
+}
+
+static void wifi_stop_ap(void)
+{
+    if (g_wifi_inited) {
+        esp_wifi_stop();
+        ESP_LOGI(TAG, "Wi-Fi AP stopped");
+    }
 }
 
 static void html_append(char **p, size_t *left, const char *fmt, ...)
@@ -620,6 +642,7 @@ static void html_append(char **p, size_t *left, const char *fmt, ...)
 
 static esp_err_t http_root_get_handler(httpd_req_t *req)
 {
+    g_last_http_activity_us = esp_timer_get_time();
     settings_t s;
     rtc_time_t now = {0};
 
@@ -789,6 +812,13 @@ static esp_err_t http_root_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static void status_led_blink_once(void)
+{
+    gpio_set_level(GPIO_STATUS_LED, 1);
+    vTaskDelay(pdMS_TO_TICKS(80));
+    gpio_set_level(GPIO_STATUS_LED, 0);
+}
+
 static void url_decode(char *dst, const char *src, size_t dst_len)
 {
     size_t di = 0;
@@ -841,9 +871,9 @@ static void start_led_test(uint32_t duration_sec)
         g_test_stage = -1;
         xSemaphoreGive(g_test_mutex);
     }
-    g_actual_red = 100 * PWM_SCALE;
-    g_actual_blue = 100 * PWM_SCALE;
-    pwm_set_percent(100, 100);
+    g_actual_red = 0;
+    g_actual_blue = 0;
+    pwm_set_percent(0, 0);
 }
 
 static bool parse_hhmm(const char *str, int *hour, int *min)
@@ -978,6 +1008,8 @@ static bool apply_rtc_from_body(const char *body)
 
 static esp_err_t http_save_post_handler(httpd_req_t *req)
 {
+    g_last_http_activity_us = esp_timer_get_time();
+    status_led_blink_once();
     char body[512];
     if (read_req_body(req, body, sizeof(body)) < 0) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Ошибка чтения");
@@ -1051,6 +1083,8 @@ static esp_err_t http_save_post_handler(httpd_req_t *req)
 
 static esp_err_t http_set_time_post_handler(httpd_req_t *req)
 {
+    g_last_http_activity_us = esp_timer_get_time();
+    status_led_blink_once();
     char body[256];
     if (read_req_body(req, body, sizeof(body)) < 0) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Ошибка чтения");
@@ -1070,6 +1104,8 @@ static esp_err_t http_set_time_post_handler(httpd_req_t *req)
 
 static esp_err_t http_test_post_handler(httpd_req_t *req)
 {
+    g_last_http_activity_us = esp_timer_get_time();
+    status_led_blink_once();
     char body[64];
     if (read_req_body(req, body, sizeof(body)) < 0) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Ошибка чтения");
@@ -1135,6 +1171,81 @@ static httpd_handle_t start_webserver(void)
     return server;
 }
 
+static void web_start(void)
+{
+    if (g_web_active) {
+        return;
+    }
+    wifi_init_ap();
+    g_http_server = start_webserver();
+    if (g_http_server) {
+        g_web_active = true;
+        g_last_http_activity_us = esp_timer_get_time();
+
+        for (int i = 0; i < 3; i++) {
+            gpio_set_level(GPIO_STATUS_LED, 1);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            gpio_set_level(GPIO_STATUS_LED, 0);
+            vTaskDelay(pdMS_TO_TICKS(150));
+        }
+    }
+}
+
+static void web_stop(void)
+{
+    if (!g_web_active) {
+        return;
+    }
+    if (g_http_server) {
+        httpd_stop(g_http_server);
+        g_http_server = NULL;
+    }
+    wifi_stop_ap();
+    g_web_active = false;
+}
+
+static void button_task(void *arg)
+{
+    (void)arg;
+    int64_t press_start = 0;
+    bool triggered = false;
+
+    while (true) {
+        int level = gpio_get_level(GPIO_BOOT_BTN);
+        if (level == 0) {
+            if (press_start == 0) {
+                press_start = esp_timer_get_time();
+                triggered = false;
+            } else if (!triggered) {
+                int64_t held_us = esp_timer_get_time() - press_start;
+                if (held_us >= (int64_t)WEB_LONG_PRESS_SEC * 1000000) {
+                    triggered = true;
+                    web_start();
+                }
+            }
+        } else {
+            press_start = 0;
+            triggered = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void web_idle_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        if (g_web_active) {
+            int64_t now = esp_timer_get_time();
+            int64_t idle_us = now - g_last_http_activity_us;
+            if (idle_us > (int64_t)WEB_IDLE_TIMEOUT_SEC * 1000000) {
+                web_stop();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 void app_main(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -1149,6 +1260,16 @@ void app_main(void)
     g_test_mutex = xSemaphoreCreateMutex();
 
     settings_load(&g_settings);
+
+    gpio_config_t status_led = {
+        .pin_bit_mask = (1ULL << GPIO_STATUS_LED),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&status_led);
+    gpio_set_level(GPIO_STATUS_LED, 0);
 
     ds1302_init();
     pwm_init(g_settings.pwm_freq_hz);
@@ -1165,18 +1286,18 @@ void app_main(void)
         }
     }
 
-    wifi_init_ap();
-    httpd_handle_t server = NULL;
-    for (int i = 0; i < 3 && !server; i++) {
-        server = start_webserver();
-        if (!server) {
-            ESP_LOGW(TAG, "HTTP server retry %d/3", i + 1);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    }
+    gpio_config_t btn = {
+        .pin_bit_mask = (1ULL << GPIO_BOOT_BTN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&btn);
 
     xTaskCreate(control_task, "control_task", 4096, NULL, 5, NULL);
+    xTaskCreate(button_task, "button_task", 4096, NULL, 4, NULL);
+    xTaskCreate(web_idle_task, "web_idle_task", 2048, NULL, 3, NULL);
 
-    ESP_LOGI(TAG, "Готово. Подключитесь к Wi-Fi %s и откройте http://%d.%d.%d.%d",
-             WIFI_SSID, WIFI_AP_IP1, WIFI_AP_IP2, WIFI_AP_IP3, WIFI_AP_IP4);
+    ESP_LOGI(TAG, "Готово. Удерживайте BOOT %d сек для запуска веб-сервера.", WEB_LONG_PRESS_SEC);
 }
