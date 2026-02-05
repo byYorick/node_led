@@ -107,6 +107,7 @@ static esp_netif_t *g_ap_netif = NULL;
 static bool g_wifi_inited = false;
 static int64_t g_last_http_activity_us = 0;
 static bool g_web_active = false;
+static portMUX_TYPE g_activity_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void ds1302_delay(void)
 {
@@ -642,7 +643,9 @@ static void html_append(char **p, size_t *left, const char *fmt, ...)
 
 static esp_err_t http_root_get_handler(httpd_req_t *req)
 {
+    portENTER_CRITICAL(&g_activity_mux);
     g_last_http_activity_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&g_activity_mux);
     settings_t s;
     rtc_time_t now = {0};
 
@@ -1008,7 +1011,9 @@ static bool apply_rtc_from_body(const char *body)
 
 static esp_err_t http_save_post_handler(httpd_req_t *req)
 {
+    portENTER_CRITICAL(&g_activity_mux);
     g_last_http_activity_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&g_activity_mux);
     status_led_blink_once();
     char body[512];
     if (read_req_body(req, body, sizeof(body)) < 0) {
@@ -1083,7 +1088,9 @@ static esp_err_t http_save_post_handler(httpd_req_t *req)
 
 static esp_err_t http_set_time_post_handler(httpd_req_t *req)
 {
+    portENTER_CRITICAL(&g_activity_mux);
     g_last_http_activity_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&g_activity_mux);
     status_led_blink_once();
     char body[256];
     if (read_req_body(req, body, sizeof(body)) < 0) {
@@ -1104,7 +1111,9 @@ static esp_err_t http_set_time_post_handler(httpd_req_t *req)
 
 static esp_err_t http_test_post_handler(httpd_req_t *req)
 {
+    portENTER_CRITICAL(&g_activity_mux);
     g_last_http_activity_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&g_activity_mux);
     status_led_blink_once();
     char body[64];
     if (read_req_body(req, body, sizeof(body)) < 0) {
@@ -1180,7 +1189,9 @@ static void web_start(void)
     g_http_server = start_webserver();
     if (g_http_server) {
         g_web_active = true;
+        portENTER_CRITICAL(&g_activity_mux);
         g_last_http_activity_us = esp_timer_get_time();
+        portEXIT_CRITICAL(&g_activity_mux);
 
         for (int i = 0; i < 3; i++) {
             gpio_set_level(GPIO_STATUS_LED, 1);
@@ -1237,7 +1248,11 @@ static void web_idle_task(void *arg)
     while (true) {
         if (g_web_active) {
             int64_t now = esp_timer_get_time();
-            int64_t idle_us = now - g_last_http_activity_us;
+            int64_t last;
+            portENTER_CRITICAL(&g_activity_mux);
+            last = g_last_http_activity_us;
+            portEXIT_CRITICAL(&g_activity_mux);
+            int64_t idle_us = now - last;
             if (idle_us > (int64_t)WEB_IDLE_TIMEOUT_SEC * 1000000) {
                 web_stop();
             }
