@@ -3,12 +3,12 @@
   "idf.espIdfPath": "/home/georgiy/esp/esp-idf",
   "idf.pythonInstallPath": "/usr/bin/python3",
   "idf.openOcdConfigs": [
-    "board/esp32-wrover-kit-3.3v.cfg"
+    "board/esp32c3-bridge.cfg"
   ],
-  "idf.port": "/dev/ttyUSB0",
+  "idf.port": "/dev/ttyACM0",
   "idf.toolsPath": "/home/georgiy/.espressif",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32"
+    "IDF_TARGET": "esp32c3"
   },
   "clangd.path": "/home/georgiy/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
   "clangd.arguments": [
@@ -16,5 +16,6 @@
     "--query-driver=**",
     "--compile-commands-dir=/home/georgiy/esp/solo/node_led/node_led/build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.currentSetup": "/home/georgiy/esp/esp-idf"
 }
